@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2021 YADRO
 
-#include <src/session.hpp>
+#include <libobmcsession/session.hpp>
+#include <iostream>
 
 namespace obmc
 {
@@ -9,15 +10,11 @@ namespace session
 {
 void SessionItem::delete_()
 {
-    auto manager = managerWeakPtr.lock();
-    if (manager)
+    SessionManager::SessionIdentifier sessionId =
+        SessionManager::parseSessionId(this->sessionID());
+    if (!managerPtr->remove(sessionId))
     {
-        SessionManager::SessionIdentifier sessionId =
-            SessionManager::parseSessionId(this->sessionID());
-        if (!manager->remove(sessionId))
-        {
-            throw InternalFailure();
-        }
+        throw InternalFailure();
     }
 }
 

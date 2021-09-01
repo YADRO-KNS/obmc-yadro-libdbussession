@@ -7,6 +7,10 @@
 
 #include <sdbusplus/bus.hpp>
 #include <xyz/openbmc_project/Session/Item/server.hpp>
+#include <xyz/openbmc_project/Session/Build/server.hpp>
+
+#include <atomic>
+#include <thread>
 
 namespace obmc
 {
@@ -15,6 +19,8 @@ namespace session
 
 using SessionItemServer =
     sdbusplus::xyz::openbmc_project::Session::server::Item;
+using SessionBuildServer =
+    sdbusplus::xyz::openbmc_project::Session::server::Build;
 
 class SessionManager;
 class SessionItem;
@@ -23,13 +29,17 @@ using SessionItemUni = std::unique_ptr<SessionItem>;
 using SessionManagerPtr = std::shared_ptr<SessionManager>;
 using SessionManagerWeakPtr = std::weak_ptr<SessionManager>;
 
-class SessionManager final : public std::enable_shared_from_this<SessionManager>
+class SessionManager final :
+    public SessionBuildServer,
+    public std::enable_shared_from_this<SessionManager>
 {
     static constexpr const char* serviceNameStartSegment =
         "xyz.openbmc_project.Session.";
+    static constexpr const char* sessionManagerObjectPath =
+        "/xyz/openbmc_project/session_manager";
 
   public:
-    using SessionIdentifier = std::uint64_t;
+    using SessionIdentifier = std::size_t;
     using SessionType = SessionItemServer::Type;
     using SessionCleanupFn = std::function<bool(SessionIdentifier)>;
 
@@ -51,10 +61,7 @@ class SessionManager final : public std::enable_shared_from_this<SessionManager>
      *                      the current instance.
      */
     SessionManager(sdbusplus::bus::bus& bus, const std::string& slug,
-                   const SessionType type) :
-        bus(bus),
-        slug(slug), serviceName(serviceNameStartSegment + slug), type(type)
-    {}
+                   const SessionType type);
 
     /**
      * @brief Create a session and publish into the dbus.
@@ -62,6 +69,7 @@ class SessionManager final : public std::enable_shared_from_this<SessionManager>
      * @param userName              - the owner user name
      * @param remoteAddress         - the IP address of the session initiator.
      *
+     * @throw logic_error           - Build new session is locked.
      * @return SessionIdentifier    - unique session ID
      */
     SessionIdentifier create(const std::string& userName,
@@ -70,6 +78,13 @@ class SessionManager final : public std::enable_shared_from_this<SessionManager>
     /**
      * @brief Create a session and publish into the dbus without appropriate
      *        session payload
+     *
+     * @note The session is incomplete. Metadata of session must be set for 10
+     *       seconds. Otherwise, the current session will be closed. All other
+     *       new session creates requests will be rejected until the current
+     *       created session accepts metadata or is removed by timeout.
+     *
+     * @throw logic_error           - Build new session is locked.
      *
      * @return SessionIdentifier    - unique session ID
      */
@@ -81,6 +96,13 @@ class SessionManager final : public std::enable_shared_from_this<SessionManager>
      *
      * @param cleanupFn             - the callback to cleanup session on
      *                                destroy.
+     *
+     * @note The session is incomplete. Metadata of session must be set for 10
+     *       seconds. Otherwise, the current session will be closed. All other
+     *       new session creates requests will be rejected until the current
+     *       created session accepts metadata or is removed by timeout.
+     *
+     * @throw logic_error           - Build new session is locked.
      *
      * @return SessionIdentifier    - unique session ID
      */
@@ -94,23 +116,33 @@ class SessionManager final : public std::enable_shared_from_this<SessionManager>
      * @param remoteAddress         - the IP address of the session initiator.
      * @param cleanupFn             - the callback to cleanup session on destroy.
      *
+     * @throw logic_error           - Build new session is locked.
+     *
      * @return SessionIdentifier    - unique session ID
      */
     SessionIdentifier create(const std::string& userName,
                              const uint32_t remoteAddress,
                              SessionCleanupFn&& cleanupFn);
 
-    /**
-     * @brief Set the Session Metadata object
+    /** @brief Commit pending session build.
      *
-     * @param sessionId     - session identifier.
-     * @param userName      - the owner user name.
-     * @param remoteAddress - the IP address of the session initiator.
-     *
+     *  @param[in] username     - the owner username of the session.
+     *  @param[in] remoteIPAddr - the IP address of the session initiator.
      */
-    void setSessionMetadata(SessionIdentifier sessionId,
-                            const std::string& userName,
-                            const uint32_t remoteAddress);
+    void commitSessionBuild(std::string username,
+                            uint32_t remoteIPAddr) override;
+
+    /** @brief Commit pending session build from remote service.
+     *
+     *  @param[in] bus         - handle to system dbus
+     *  @param[in] slug         - the slug of service that is managing target
+     *                            session.
+     *  @param[in] username     - the owner username of the session.
+     *  @param[in] remoteIPAddr - the IP address of the session initiator.
+     */
+    static void commitSessionBuild(sdbusplus::bus::bus& bus, std::string slug,
+                                   std::string username, uint32_t remoteIPAddr);
+
     /**
      * @brief Remove a dbus session object from storage and unpublish it from
      *        dbus.
@@ -165,6 +197,8 @@ class SessionManager final : public std::enable_shared_from_this<SessionManager>
      */
     std::size_t removeAll() const;
 
+    bool isSessionBuildPending() const;
+    void resetPendginSessilBuild();
   protected:
     friend class SessionItem;
     using DBusSubTreeOut =
@@ -248,11 +282,30 @@ class SessionManager final : public std::enable_shared_from_this<SessionManager>
         getSessionDetails(const std::string& serviceName,
                           const std::string& objectPath) const;
 
+    /**
+     * @brief Start timer to observe timeout of finilize session build
+     *        transaction.
+     *
+     * @param sessionId
+     */
+    void sessionBuildTimerStart(SessionIdentifier sessionId);
+
+    /**
+     * @brief Finalize session build transaction.
+     *
+     */
+    void sessionBuildSucess();
+
   private:
     sdbusplus::bus::bus& bus;
+    std::unique_ptr<sdbusplus::server::manager::manager> dbusManager;
     const std::string slug;
     const std::string serviceName;
     const SessionType type;
+
+    std::thread timerSessionComplete;
+    std::atomic<bool> pendingSessionBuild;
+    SessionIdentifier pendingSessionId;
 
     using SessionItemDict = std::map<SessionIdentifier, SessionItemUni>;
     SessionItemDict sessionItems;

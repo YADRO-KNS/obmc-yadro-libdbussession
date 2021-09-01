@@ -2,10 +2,11 @@
 // Copyright (C) 2021 YADRO
 
 #include <libobmcsession/manager.hpp>
+#include <libobmcsession/session.hpp>
 #include <sdbusplus/server/object.hpp>
-#include <src/session.hpp>
 #include <xyz/openbmc_project/Object/Delete/client.hpp>
 #include <xyz/openbmc_project/Session/Item/client.hpp>
+#include <xyz/openbmc_project/Session/Build/client.hpp>
 
 #include <chrono>
 #include <iomanip>
@@ -17,17 +18,33 @@ namespace obmc
 namespace session
 {
 
-constexpr const char* sessionManagerObjectPath =
-    "/xyz/openbmc_project/session_manager/";
+SessionManager::SessionManager(sdbusplus::bus::bus& bus,
+                               const std::string& slug,
+                               const SessionType type) :
+    SessionBuildServer(bus, sessionManagerObjectPath),
+    bus(bus), slug(slug), serviceName(serviceNameStartSegment + slug),
+    type(type), pendingSessionBuild(false)
+{
+    dbusManager = std::make_unique<sdbusplus::server::manager::manager>(
+        bus, sessionManagerObjectPath);
+    bus.request_name(serviceName.c_str());
+}
 
 SessionManager::SessionIdentifier
     SessionManager::create(const std::string& userName,
                            const uint32_t remoteAddress)
 {
+    if (isSessionBuildPending())
+    {
+        throw std::logic_error(
+            "Pending a session creation finish. Building a new session is locked.");
+    }
+
     auto sessionId = generateSessionId();
+
     auto sessionObjectPath = getSessionObjectPath(sessionId);
-    auto session =
-        std::make_unique<SessionItem>(bus, sessionObjectPath, weak_from_this());
+    auto session = std::make_unique<SessionItem>(bus, sessionObjectPath,
+                                                 shared_from_this());
 
     session->sessionID(hexSessionId(sessionId));
     session->sessionType(type);
@@ -57,6 +74,7 @@ SessionManager::SessionIdentifier
 SessionManager::SessionIdentifier SessionManager::create()
 {
     auto sessionId = this->create("", 0);
+    sessionBuildTimerStart(sessionId);
     return sessionId;
 }
 
@@ -69,40 +87,34 @@ SessionManager::SessionIdentifier
     return sessionId;
 }
 
-void SessionManager::setSessionMetadata(SessionIdentifier sessionId,
-                                        const std::string& userName,
-                                        const uint32_t remoteAddress)
+void SessionManager::commitSessionBuild(std::string username,
+                            uint32_t remoteIPAddr)
 {
-    auto objects = findSessionItemObjects();
-    auto hexSessionId = this->hexSessionId(sessionId);
-    for (const auto& [sessionObjectPath, objectMetaDict] : objects)
+    if (!isSessionBuildPending())
     {
-        if (objectMetaDict.empty())
-        {
-            continue;
-        }
-        const auto& serviceName = objectMetaDict.begin()->first;
-        const auto details = getSessionDetails(serviceName, sessionObjectPath);
-        for (const auto& [propertyName, propertyValue] : details)
-        {
-            if (propertyName == "SessionID")
-            {
-                const std::string* sessionIdStr =
-                    std::get_if<std::string>(&propertyValue);
-                if (sessionIdStr != nullptr && hexSessionId == *sessionIdStr)
-                {
-                    auto callMethod = bus.new_method_call(
-                        serviceName.c_str(), sessionObjectPath.c_str(),
-                        sdbusplus::xyz::openbmc_project::Session::client::Item::
-                            interface,
-                        "SetSessionMetadata");
-                    callMethod.append(userName, remoteAddress);
-                    bus.call_noreply(callMethod);
-                    return;
-                }
-            }
-        }
+        return;
     }
+    SessionItemDict::iterator sessionIt = sessionItems.find(this->pendingSessionId);
+    if (sessionIt == sessionItems.end())
+    {
+        return;
+    }
+
+    sessionIt->second->setSessionMetadata(username, remoteIPAddr);
+    sessionBuildSucess();
+}
+
+void SessionManager::commitSessionBuild(sdbusplus::bus::bus& bus,
+                                        std::string slug, std::string username,
+                                        uint32_t remoteIPAddr)
+{
+    auto serviceName = serviceNameStartSegment + slug;
+    auto callMethod = bus.new_method_call(
+        serviceName.c_str(), sessionManagerObjectPath,
+        sdbusplus::xyz::openbmc_project::Session::client::Build::interface,
+        "CommitSessionBuild");
+    callMethod.append(username, remoteIPAddr);
+    bus.call_noreply(callMethod);
 }
 
 bool SessionManager::remove(SessionIdentifier sessionId)
@@ -112,7 +124,7 @@ bool SessionManager::remove(SessionIdentifier sessionId)
     {
         return false;
     }
-    sessionItems.erase(sessionIt);
+    sessionItems.extract(sessionIt);
     return true;
 }
 
@@ -255,6 +267,17 @@ std::size_t SessionManager::removeAll() const
     return handledSessions;
 }
 
+bool SessionManager::isSessionBuildPending() const
+{
+    return pendingSessionBuild;
+}
+
+void SessionManager::resetPendginSessilBuild()
+{
+    this->pendingSessionBuild = false;
+    this->pendingSessionId = 0;
+}
+
 SessionManager::SessionIdentifier SessionManager::generateSessionId() const
 {
     auto time = std::chrono::high_resolution_clock::now();
@@ -273,7 +296,7 @@ const std::string
 
 const std::string SessionManager::getSessionManagerObjectPath() const
 {
-    return sessionManagerObjectPath + slug;
+    return std::string(sessionManagerObjectPath) + "/" + slug;
 }
 
 const std::string SessionManager::hexSessionId(SessionIdentifier sessionId)
@@ -294,14 +317,15 @@ const SessionManager::DBusSubTreeOut
     SessionManager::findSessionItemObjects() const
 {
     constexpr const std::array sessionItemObjectIfaces = {
-        "xyz.openbmc_project.Session.Item"};
+        sdbusplus::xyz::openbmc_project::Session::client::Item::interface};
 
     DBusSubTreeOut getSessionItemObjects;
     auto callMethod =
         bus.new_method_call("xyz.openbmc_project.ObjectMapper",
                             "/xyz/openbmc_project/object_mapper",
                             "xyz.openbmc_project.ObjectMapper", "GetSubTree");
-    callMethod.append(sessionManagerObjectPath, 0U, sessionItemObjectIfaces);
+    callMethod.append(sessionManagerObjectPath, static_cast<int32_t>(0),
+                      sessionItemObjectIfaces);
     bus.call(callMethod).read(getSessionItemObjects);
 
     return std::forward<DBusSubTreeOut>(getSessionItemObjects);
@@ -322,18 +346,38 @@ const SessionManager::DBusSessionDetailsMap
     SessionManager::getSessionDetails(const std::string& serviceName,
                                       const std::string& objectPath) const
 {
-    constexpr const std::array sessionItemObjectIfaces = {
-        "xyz.openbmc_project.Session.Item"};
-
     SessionManager::DBusSessionDetailsMap sessionDetails;
 
     auto callMethod =
         bus.new_method_call(serviceName.c_str(), objectPath.c_str(),
                             "org.freedesktop.DBus.Properties", "GetAll");
-    callMethod.append(sessionItemObjectIfaces);
+    callMethod.append(
+        sdbusplus::xyz::openbmc_project::Session::client::Item::interface);
     bus.call(callMethod).read(sessionDetails);
-
     return std::forward<SessionManager::DBusSessionDetailsMap>(sessionDetails);
+}
+
+void SessionManager::sessionBuildTimerStart(SessionIdentifier sessionId)
+{
+    this->pendingSessionBuild = true;
+    this->pendingSessionId = sessionId;
+    this->timerSessionComplete =
+        std::thread(std::move([manager = shared_from_this()] {
+            std::this_thread::sleep_for(std::chrono::seconds(10));
+            if (manager->isSessionBuildPending())
+            {
+                manager->remove(manager->pendingSessionId);
+                manager->resetPendginSessilBuild();
+            }
+            return true;
+        }));
+
+    this->timerSessionComplete.detach();
+}
+
+void SessionManager::sessionBuildSucess()
+{
+    resetPendginSessilBuild();
 }
 
 } // namespace session

@@ -41,14 +41,14 @@ class SessionItem :
      *
      * @param[in] bus               - Handle to system dbus
      * @param[in] objPath           - The Dbus path that hosts Session Item.
-     * @param[in] managerWeakPtr    - The weakptr of manager.
+     * @param[in] managerPtr        - The pointer of manager.
      */
     SessionItem(sdbusplus::bus::bus& bus, const std::string& objPath,
-                SessionManagerWeakPtr managerWeakPtr) :
+                SessionManagerPtr managerPtr) :
         SessionItemServerObject(bus, objPath.c_str()),
         AssocDefinitionServerObject(bus, objPath.c_str()),
         DeleteServerObject(bus, objPath.c_str()), bus(bus), path(objPath),
-        managerWeakPtr(managerWeakPtr)
+        managerPtr(managerPtr)
     {
         // Nothing to do here
     }
@@ -57,17 +57,18 @@ class SessionItem :
      *
      * @param[in] bus           - Handle to system dbus
      * @param[in] objPath       - The Dbus path that hosts Session Item
+     * @param[in] managerPtr        - The pointer of manager.
      * @param[in] cleanupFn     - The callback will be handling a customized
      *                            cleanup of the session on the session-item
      *                            removal.
      */
     SessionItem(sdbusplus::bus::bus& bus, const std::string& objPath,
-                SessionManagerWeakPtr managerWeakPtr,
+                SessionManagerPtr managerPtr,
                 SessionManager::SessionCleanupFn&& cleanupFn) :
         SessionItemServerObject(bus, objPath.c_str()),
         AssocDefinitionServerObject(bus, objPath.c_str()),
         DeleteServerObject(bus, objPath.c_str()), bus(bus), path(objPath),
-        managerWeakPtr(managerWeakPtr), cleanupFn(cleanupFn)
+        managerPtr(managerPtr), cleanupFn(cleanupFn)
     {
         // Nothing to do here
     }
@@ -103,13 +104,13 @@ class SessionItem :
     void resetCleanupFn(SessionManager::SessionCleanupFn&&);
 
     /**
-     * @brief Associate user of specified UID with the current session.
+     * @brief Associate user of specified username with the current session.
      *
-     * @param userName              - the user name to associate with the
-     *                                current session.
+     * @param userName          - the user name to associate with the
+     *                            current session.
      *
-     * @throw std::exception          failure on set user object relation to
-     *                                the current session
+     * @throw std::exception    failure on set user object relation to
+     *                          the current session
      */
     void adjustSessionOwner(const std::string& userName);
 
@@ -118,7 +119,7 @@ class SessionItem :
     sdbusplus::bus::bus& bus;
     /** @brief Path of the group instance */
     const std::string path;
-    SessionManagerWeakPtr managerWeakPtr;
+    SessionManagerPtr managerPtr;
     SessionManager::SessionCleanupFn cleanupFn;
 };
 

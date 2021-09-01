@@ -10,6 +10,7 @@ project('libobmcsession', 'cpp',
 pkg = import('pkgconfig')
 
 boost = dependency('boost', required: true)
+threads = dependency('threads', required: true)
 sdbusplus_dep = dependency('sdbusplus', required: true)
 pdi_dep = dependency('phosphor-dbus-interfaces', required: true)
 
@@ -30,7 +31,10 @@ libruntime_so_version = '@0@.@1@.@2@'.format((libruntime_lt_c - libruntime_lt_a)
                                               libruntime_lt_a,
                                               libruntime_lt_r)
 
-install_headers('include/libobmcsession/manager.hpp', subdir: 'libobmcsession')
+install_headers(
+    'include/libobmcsession/manager.hpp',
+    'include/libobmcsession/session.hpp',
+    subdir: 'libobmcsession')
 
 obmcsession = shared_library('obmcsession',
     'src/manager.cpp',
@@ -39,6 +43,7 @@ obmcsession = shared_library('obmcsession',
     version : libruntime_so_version,
     dependencies: [
         boost,
+        threads,
         sdbusplus_dep,
         pdi_dep,
     ],
