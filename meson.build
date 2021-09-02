@@ -13,6 +13,7 @@ boost = dependency('boost', required: true)
 threads = dependency('threads', required: true)
 sdbusplus_dep = dependency('sdbusplus', required: true)
 pdi_dep = dependency('phosphor-dbus-interfaces', required: true)
+pl_dep = dependency('phosphor-logging', required: true)
 
 cpp_args = [
     '-DBOOST_SYSTEM_NO_DEPRECATED',
@@ -32,11 +33,14 @@ libruntime_so_version = '@0@.@1@.@2@'.format((libruntime_lt_c - libruntime_lt_a)
                                               libruntime_lt_r)
 
 install_headers(
-    'include/libobmcsession/manager.hpp',
-    'include/libobmcsession/session.hpp',
+    'include/libobmcsession/obmcsession.h',
+    'include/libobmcsession/obmcsession.hpp',
+    'include/libobmcsession/obmcsession_proto.h',
+    'include/libobmcsession/obmcsession_proto.hpp',
     subdir: 'libobmcsession')
 
 obmcsession = shared_library('obmcsession',
+    'src/api.cpp',
     'src/manager.cpp',
     'src/session.cpp',
     cpp_args: cpp_args,
@@ -46,9 +50,11 @@ obmcsession = shared_library('obmcsession',
         threads,
         sdbusplus_dep,
         pdi_dep,
+        pl_dep,
     ],
     include_directories: [
-        'include'
+        'include',
+        'src',
     ],
     install: true,
 )

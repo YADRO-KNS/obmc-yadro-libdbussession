@@ -5,12 +5,16 @@
 
 #pragma once
 
-#include <sdbusplus/bus.hpp>
+#include <dbus.hpp>
 #include <xyz/openbmc_project/Session/Item/server.hpp>
 #include <xyz/openbmc_project/Session/Build/server.hpp>
 
+#include <libobmcsession/obmcsession_proto.hpp>
+
 #include <atomic>
+#include <condition_variable>
 #include <thread>
+#include <chrono>
 
 namespace obmc
 {
@@ -25,9 +29,11 @@ using SessionBuildServer =
 class SessionManager;
 class SessionItem;
 
-using SessionItemUni = std::unique_ptr<SessionItem>;
+using SessionItemPtr = std::shared_ptr<SessionItem>;
 using SessionManagerPtr = std::shared_ptr<SessionManager>;
 using SessionManagerWeakPtr = std::weak_ptr<SessionManager>;
+
+using namespace obmc::dbus;
 
 class SessionManager final :
     public SessionBuildServer,
@@ -38,13 +44,32 @@ class SessionManager final :
     static constexpr const char* sessionManagerObjectPath =
         "/xyz/openbmc_project/session_manager";
 
+    struct NullDeleter{
+        void operator()(sdbusplus::bus::bus*){}
+    };
   public:
-    using SessionIdentifier = std::size_t;
     using SessionType = SessionItemServer::Type;
-    using SessionCleanupFn = std::function<bool(SessionIdentifier)>;
+
+    struct InternalSessionInfo 
+    {
+        SessionIdentifier id;
+        std::string username;
+        std::string remoteAddress;
+        SessionType type;
+        std::string serviceName;
+        std::string objectPath;
+        bool isOwn;
+    };
+    using InternalSessionInfoList =
+        std::map<SessionIdentifier, InternalSessionInfo>;
 
     SessionManager() = delete;
-    ~SessionManager() = default;
+    ~SessionManager()
+    {
+        // The stored pointer must be released without deleter because we store
+        // reference as a pointer.
+        bus.release();
+    }
     SessionManager(const SessionManager&) = delete;
     SessionManager& operator=(const SessionManager&) = delete;
     SessionManager(SessionManager&&) = delete;
@@ -53,7 +78,7 @@ class SessionManager final :
     /** @brief Constructs session manager
      *
      * @param[in] bus     - Handle to system dbus
-     * @param[in] objPath - The Dbus service slug uniquely identifying the source
+     * @param[in] slug    - The Dbus service slug uniquely identifying the source
      *                      of a session to create the appropriate items from.
      *                      Service name template:
      *                      'xyz.openbmc_project.Session.${slug}'.
@@ -61,6 +86,19 @@ class SessionManager final :
      *                      the current instance.
      */
     SessionManager(sdbusplus::bus::bus& bus, const std::string& slug,
+                   const SessionType type);
+
+    /** @brief Constructs session manager
+     *
+     * @param[in] bus     - Handle to system dbus
+     * @param[in] slug    - The Dbus service slug uniquely identifying the source
+     *                      of a session to create the appropriate items from.
+     *                      Service name template:
+     *                      'xyz.openbmc_project.Session.${slug}'.
+     * @param[in] type    - Type of all session items that will be created by
+     *                      the current instance.
+     */
+    SessionManager(sdbusplus::bus::bus&& bus, const std::string& slug,
                    const SessionType type);
 
     /**
@@ -73,7 +111,7 @@ class SessionManager final :
      * @return SessionIdentifier    - unique session ID
      */
     SessionIdentifier create(const std::string& userName,
-                             const uint32_t remoteAddress);
+                             const std::string& remoteAddress);
 
     /**
      * @brief Create a session and publish into the dbus without appropriate
@@ -88,7 +126,7 @@ class SessionManager final :
      *
      * @return SessionIdentifier    - unique session ID
      */
-    SessionIdentifier create();
+    SessionIdentifier startTransaction();
 
     /**
      * @brief Create a session and publish into the dbus without appropriate
@@ -106,7 +144,7 @@ class SessionManager final :
      *
      * @return SessionIdentifier    - unique session ID
      */
-    SessionIdentifier create(SessionCleanupFn&& cleanupFn);
+    SessionIdentifier startTransaction(SessionCleanupFn&& cleanupFn);
 
     /**
      * @brief Create a session and publish into the dbus with cleanup callback
@@ -121,8 +159,27 @@ class SessionManager final :
      * @return SessionIdentifier    - unique session ID
      */
     SessionIdentifier create(const std::string& userName,
-                             const uint32_t remoteAddress,
+                             const std::string& remoteAddress,
                              SessionCleanupFn&& cleanupFn);
+
+    // /**
+    //  * @brief  Start the session build transaction.
+    //  *
+    //  * @note No concurent transaction available, any new starting transaction
+    //  *       reqiests will be rejected with `NotAllowed` error.
+    //  *       When transaction is started the target session service will wait
+    //  *       for commit for 20 seconds.
+    //  *
+    //  *  @param[in] username         - Owner username of the session
+    //  *  @param[in] remoteIPAddr     - Remote IP address.
+    //  */
+    // void startTransaction(const std::string username,
+    //                       const std::string remoteIPAddr) override;
+
+    // /** 
+    //  * @brief Finalize building a new session with predefined metadata.
+    //  */
+    // void commit() override;
 
     /** @brief Commit pending session build.
      *
@@ -130,7 +187,7 @@ class SessionManager final :
      *  @param[in] remoteIPAddr - the IP address of the session initiator.
      */
     void commitSessionBuild(std::string username,
-                            uint32_t remoteIPAddr) override;
+                            std::string remoteIPAddr) override;
 
     /** @brief Commit pending session build from remote service.
      *
@@ -141,18 +198,23 @@ class SessionManager final :
      *  @param[in] remoteIPAddr - the IP address of the session initiator.
      */
     static void commitSessionBuild(sdbusplus::bus::bus& bus, std::string slug,
-                                   std::string username, uint32_t remoteIPAddr);
+                                   std::string username, std::string remoteIPAddr);
 
     /**
      * @brief Remove a dbus session object from storage and unpublish it from
      *        dbus.
      *
      * @param sessionId     - unique session ID to remove from storage
+     * @param withCleanup   - specifies whether to call configured cleanup
+     *                        routine on the session removing.
+     * @param localLookup   - specifies whether search session object only at
+     *                        current session manager or globally.
      *
      * @return true         - success
      * @return false        - fail
      */
-    bool remove(SessionIdentifier sessionId);
+    bool remove(SessionIdentifier sessionId, bool withCleanup = true,
+                bool localLookup = false);
 
     /**
      * @brief Remove all sessions associated with the specified user.
@@ -163,7 +225,7 @@ class SessionManager final :
      *
      * @return std::size_t  - count of closed sessions
      */
-    std::size_t removeAll(const std::string& userName) const;
+    std::size_t removeAll(const std::string& userName);
 
     /**
      * @brief Remove all sessions which have been opened from the specified IPv4
@@ -175,7 +237,7 @@ class SessionManager final :
      *
      * @return std::size_t  - count of closed sessions
      */
-    std::size_t removeAll(uint32_t remoteAddress) const;
+    std::size_t removeAllByRemoteAddress(const std::string& remoteAddress);
 
     /**
      * @brief Remove all sessions of specified type.
@@ -186,7 +248,7 @@ class SessionManager final :
      *
      * @return std::size_t - count of closed sessions
      */
-    std::size_t removeAll(SessionType type) const;
+    std::size_t removeAll(SessionType type);
 
     /**
      * @brief Unconditional removes all opened sessions.
@@ -195,26 +257,49 @@ class SessionManager final :
      *
      * @return std::size_t - count of closed sessions
      */
-    std::size_t removeAll() const;
+    std::size_t removeAll();
 
-    bool isSessionBuildPending() const;
-    void resetPendginSessilBuild();
-  protected:
-    friend class SessionItem;
-    using DBusSubTreeOut =
-        std::map<std::string, std::map<std::string, std::vector<std::string>>>;
-    using UserAssociation = std::tuple<std::string, std::string, std::string>;
-    using UserAssociationList = std::vector<UserAssociation>;
-    using DBusSessionDetailsMap =
-        std::map<std::string,
-                 std::variant<std::string, uint32_t, UserAssociationList>>;
     /**
-     * @brief Generate new session depened on current session manager slug and
-     *        timestamp.
+     * @brief Get transaction status of session building
      *
-     * @return SessionIdentifier - a new session identifier
+     * @return true - transaction is process
+     * @return false - transaction not started
      */
-    SessionIdentifier generateSessionId() const;
+    bool isSessionBuildPending() const;
+
+    /**
+     * @brief Reset the active session build transaction
+     *
+     */
+    void resetPendginSessionBuild();
+
+    /**
+     * @brief Get list of all session with detailed information.
+     *
+     * @throw std::exception    - failure to retrieve sessions list
+     */
+    void getAllSessions(InternalSessionInfoList& sessionsList) const;
+
+    /**
+     * @brief Get session details by session identifier.
+     *
+     * @param[in] sessionId         - session identifier
+     * @param[out] sessionInfo      - the internal session info
+     *
+     * @throw std::invalid_argument - session not found
+     * @throw std::runtime_error    - failure to retrieve session by specified ID.
+     */
+    void getSessionInfo(SessionIdentifier id, InternalSessionInfo& sessionInfo) const;
+
+    /**
+     * @brief Cast session id hex view to the SessionIdentifier.
+     *
+     * @throw std::invalid_argument exception
+     * @throw std::out_of_range exception
+     *
+     * @return SessionIdentifier
+     */
+    static SessionIdentifier parseSessionId(const std::string);
 
     /**
      * @brief Get the Session Object Path object
@@ -223,6 +308,16 @@ class SessionManager final :
      *         identifier
      */
     const std::string getSessionObjectPath(SessionIdentifier) const;
+  protected:
+    friend class SessionItem;
+
+    /**
+     * @brief Generate new session depened on current session manager slug and
+     *        timestamp.
+     *
+     * @return SessionIdentifier - a new session identifier
+     */
+    SessionIdentifier generateSessionId() const;
 
     /**
      * @brief Get the Session Manager Object Path object
@@ -240,22 +335,12 @@ class SessionManager final :
     static const std::string hexSessionId(SessionIdentifier);
 
     /**
-     * @brief Cast session id hex view to the SessionIdentifier.
-     *
-     * @throw std::invalid_argument exception
-     * @throw std::out_of_range exception
-     *
-     * @return SessionIdentifier
-     */
-    static SessionIdentifier parseSessionId(const std::string);
-
-    /**
-     * @brief Find all session objects
+     * @brief Find external session objects
      *
      * @throw std::exception failure on search item object
      *
-     * @return const DBusSubTreeOut - session objects dictionary with
-     *         appropriate dbus Service, Interfaces.
+     * @return const InternalSessionInfoList - session objects dictionary with
+     *         appropriate internal list of session info.
      */
     const DBusSubTreeOut findSessionItemObjects() const;
 
@@ -264,14 +349,17 @@ class SessionManager final :
      *
      * @param serviceName   - session object service name
      * @param objectPath    - session object path to close
+     * @param withCleanup   - Specifies whether to call configured cleanup
+     *                        routine on the session removing.
      *
      * @throw std::exception failure on deleting item object
      */
     void callCloseSession(const std::string& serviceName,
-                          const std::string& objectPath) const;
+                          const std::string& objectPath,
+                          bool withCleanup = true) const;
 
     /**
-     * @brief Retrieve session details
+     * @brief Retrieve sessions list with detailed information
      *
      * @param serviceName   - session object service name
      * @param objectPath    - session object path
@@ -279,7 +367,7 @@ class SessionManager final :
      * @throw std::exception failure on retrieving session details
      */
     const DBusSessionDetailsMap
-        getSessionDetails(const std::string& serviceName,
+        getSessionsProperties(const std::string& serviceName,
                           const std::string& objectPath) const;
 
     /**
@@ -296,8 +384,24 @@ class SessionManager final :
      */
     void sessionBuildSucess();
 
+    /**
+     * @brief Get the list of all Session in the InternalSessionInfo view
+     *
+     * @param[in] sessionSubTree     - the DBus subtree of all session
+     *                                 objects
+     * @param[out] sessionsList      - found sessions
+     * @param[in] listSearchSessions - (optional) the list session identifiers
+     *                                 that the search is handled for.
+     *
+     * @throw std::exception         - failure to retrieve the sessions info
+     *                                 list
+     */
+    void getSessionsInfo(const DBusSubTreeOut& sessionSubTree,
+                         InternalSessionInfoList& sessionsList,
+                         std::optional<std::vector<SessionIdentifier>>
+                             listSearchingSessions = std::nullopt) const;
   private:
-    sdbusplus::bus::bus& bus;
+    std::unique_ptr<sdbusplus::bus::bus> bus;
     std::unique_ptr<sdbusplus::server::manager::manager> dbusManager;
     const std::string slug;
     const std::string serviceName;
@@ -306,8 +410,11 @@ class SessionManager final :
     std::thread timerSessionComplete;
     std::atomic<bool> pendingSessionBuild;
     SessionIdentifier pendingSessionId;
+    
+    std::condition_variable cvTransaction;
+    std::mutex cvmTransaction;
 
-    using SessionItemDict = std::map<SessionIdentifier, SessionItemUni>;
+    using SessionItemDict = std::map<SessionIdentifier, SessionItemPtr>;
     SessionItemDict sessionItems;
 };
 } // namespace session
