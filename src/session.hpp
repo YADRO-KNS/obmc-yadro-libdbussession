@@ -5,30 +5,37 @@
 
 #include <unistd.h>
 
-#include <libobmcsession/manager.hpp>
+#include <phosphor-logging/elog-errors.hpp>
+#include <phosphor-logging/log.hpp>
+
+#include <manager.hpp>
 #include <xyz/openbmc_project/Association/Definitions/server.hpp>
-#include <xyz/openbmc_project/Common/error.hpp>
-#include <xyz/openbmc_project/Object/Delete/server.hpp>
 
 namespace obmc
 {
 namespace session
 {
 
+using namespace phosphor::logging;
+
 using SessionItemServerObject =
     sdbusplus::server::object::object<SessionItemServer>;
 using AssocDefinitionServerObject = sdbusplus::server::object::object<
     sdbusplus::xyz::openbmc_project::Association::server::Definitions>;
 
-using DeleteServerObject = sdbusplus::server::object::object<
-    sdbusplus::xyz::openbmc_project::Object::server::Delete>;
-using InternalFailure =
-    sdbusplus::xyz::openbmc_project::Common::Error::InternalFailure;
+class UnknownUser: public std::logic_error
+{
+    static constexpr auto errDesc = "Unkown username was given.";
+
+  public:
+    UnknownUser(): std::logic_error(errDesc)
+    {}
+    ~UnknownUser() override = default;
+};
 
 class SessionItem :
     public SessionItemServerObject,
-    public AssocDefinitionServerObject,
-    public DeleteServerObject
+    public AssocDefinitionServerObject
 {
   public:
     SessionItem() = delete;
@@ -41,14 +48,13 @@ class SessionItem :
      *
      * @param[in] bus               - Handle to system dbus
      * @param[in] objPath           - The Dbus path that hosts Session Item.
-     * @param[in] managerWeakPtr    - The weakptr of manager.
+     * @param[in] managerPtr        - The pointer of manager.
      */
     SessionItem(sdbusplus::bus::bus& bus, const std::string& objPath,
-                SessionManagerWeakPtr managerWeakPtr) :
+                SessionManagerPtr managerPtr) :
         SessionItemServerObject(bus, objPath.c_str()),
-        AssocDefinitionServerObject(bus, objPath.c_str()),
-        DeleteServerObject(bus, objPath.c_str()), bus(bus), path(objPath),
-        managerWeakPtr(managerWeakPtr)
+        AssocDefinitionServerObject(bus, objPath.c_str()), bus(bus),
+        path(objPath), managerPtr(managerPtr)
     {
         // Nothing to do here
     }
@@ -57,17 +63,16 @@ class SessionItem :
      *
      * @param[in] bus           - Handle to system dbus
      * @param[in] objPath       - The Dbus path that hosts Session Item
+     * @param[in] managerPtr        - The pointer of manager.
      * @param[in] cleanupFn     - The callback will be handling a customized
      *                            cleanup of the session on the session-item
      *                            removal.
      */
     SessionItem(sdbusplus::bus::bus& bus, const std::string& objPath,
-                SessionManagerWeakPtr managerWeakPtr,
-                SessionManager::SessionCleanupFn&& cleanupFn) :
+                SessionManagerPtr managerPtr, SessionCleanupFn&& cleanupFn) :
         SessionItemServerObject(bus, objPath.c_str()),
-        AssocDefinitionServerObject(bus, objPath.c_str()),
-        DeleteServerObject(bus, objPath.c_str()), bus(bus), path(objPath),
-        managerWeakPtr(managerWeakPtr), cleanupFn(cleanupFn)
+        AssocDefinitionServerObject(bus, objPath.c_str()), bus(bus),
+        path(objPath), managerPtr(managerPtr), cleanupFn(cleanupFn)
     {
         // Nothing to do here
     }
@@ -76,50 +81,64 @@ class SessionItem :
     {
         if (cleanupFn != nullptr)
         {
-            std::invoke(cleanupFn, identifier);
+            SessionIdentifier sessionId =
+                SessionManager::parseSessionId(this->sessionID());
+            std::invoke(cleanupFn, sessionId);
         }
     }
 
-    /**
-     * @brief callback to delete object of the
-     *        `xyz.openbmc_project.Object.Delete` dbus interface method
+    /** @brief Close the exist session.
      *
+     *  @param[in] handle   - Specifies it is required to post-processing the
+     *                        session closing  with the configured handler.
      */
-    void delete_() override;
+    void close(bool handle) override;
 
-    /** @brief Implementation for SetSessionMetadata
-     *         Set Username and Remote IP addres of exist session.
+    /** @brief Set Username and Remote IP addres of exist session.
      *
      *  @param[in] username         - Owner username of the session
      *  @param[in] remoteIPAddr     - Remote IP address.
      */
-    void setSessionMetadata(std::string username,
-                            uint32_t remoteIPAddr) override;
+    void setSessionMetadata(std::string username, std::string remoteIPAddr);
 
     /**
      * @brief Callback function to a session cleanup on the close.
      *
      */
-    void resetCleanupFn(SessionManager::SessionCleanupFn&&);
+    void resetCleanupFn(SessionCleanupFn&&);
 
     /**
-     * @brief Associate user of specified UID with the current session.
+     * @brief Associate user of specified username with the current session.
      *
-     * @param userName              - the user name to associate with the
-     *                                current session.
+     * @param userName          - the user name to associate with the
+     *                            current session.
      *
-     * @throw std::exception          failure on set user object relation to
-     *                                the current session
+     * @throw std::exception    failure on set user object relation to
+     *                          the current session
      */
     void adjustSessionOwner(const std::string& userName);
 
+    /** 
+     * @brief Get the session owner username
+     * 
+     * @throw logic_error       - the username has not been set.
+     * 
+     * @return std::string      - the session username
+     */ 
+    const std::string getOwner() const;
+
+    static const std::string
+        retrieveUserFromObjectPath(const std::string& objectPath);
+
+    static SessionIdentifier
+        retrieveIdFromObjectPath(const std::string& objectPath);
+
   private:
-    SessionManager::SessionIdentifier identifier;
     sdbusplus::bus::bus& bus;
     /** @brief Path of the group instance */
     const std::string path;
-    SessionManagerWeakPtr managerWeakPtr;
-    SessionManager::SessionCleanupFn cleanupFn;
+    SessionManagerPtr managerPtr;
+    SessionCleanupFn cleanupFn;
 };
 
 } // namespace session

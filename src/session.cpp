@@ -1,34 +1,54 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2021 YADRO
 
-#include <src/session.hpp>
+#include <dbus.hpp>
+#include <session.hpp>
+
+#include <iostream>
+
+#include <phosphor-logging/elog-errors.hpp>
+#include <phosphor-logging/log.hpp>
 
 namespace obmc
 {
 namespace session
 {
-void SessionItem::delete_()
+
+using namespace phosphor::logging;
+
+void SessionItem::close(bool handle)
 {
-    auto manager = managerWeakPtr.lock();
-    if (manager)
+    SessionIdentifier sessionId =
+        SessionManager::parseSessionId(this->sessionID());
+
+    log<level::DEBUG>("SessionItem::close()", entry("SESSIONID=%d", sessionId),
+                      entry("ISCLEANUP=%d", handle));
+
+    auto cleanupFnPtr = cleanupFn;
+    if (!handle && cleanupFn)
     {
-        SessionManager::SessionIdentifier sessionId =
-            SessionManager::parseSessionId(this->sessionID());
-        if (!manager->remove(sessionId))
-        {
-            throw InternalFailure();
-        }
+        resetCleanupFn(nullptr);
+    }
+    if (!managerPtr->remove(sessionId, handle, true))
+    {
+        // Restore cleanup function if something fail.
+        resetCleanupFn(std::forward<SessionCleanupFn>(cleanupFnPtr));
+        throw InternalFailure();
     }
 }
 
 void SessionItem::setSessionMetadata(std::string username,
-                                     uint32_t remoteIPAddr)
+                                     std::string remoteIPAddr)
 {
     this->adjustSessionOwner(username);
+    if (remoteIPAddr.empty())
+    {
+        throw InvalidArgument();
+    }
     this->remoteIPAddr(remoteIPAddr);
 }
 
-void SessionItem::resetCleanupFn(SessionManager::SessionCleanupFn&& cleanup)
+void SessionItem::resetCleanupFn(SessionCleanupFn&& cleanup)
 {
     this->cleanupFn = cleanup;
 }
@@ -51,13 +71,42 @@ void SessionItem::adjustSessionOwner(const std::string& userName)
 
     if (getUserObject.empty())
     {
-        throw std::runtime_error("The username '" + userName +
-                                 "' is not found");
+        throw UnknownUser();
     }
 
     this->associations({
         make_tuple("user", "session", userObjectPath),
     });
+}
+
+const std::string SessionItem::getOwner() const
+{
+    for (const auto assocTuple : associations())
+    {
+        const std::string assocType = std::get<0>(assocTuple);
+        if (assocType != std::string("user"))
+        {
+            continue;
+        }
+        const std::string userObjectPath = std::get<2>(assocTuple);
+
+        return retrieveUserFromObjectPath(userObjectPath);
+    }
+
+    throw std::logic_error("The username has not been set.");
+}
+
+const std::string
+    SessionItem::retrieveUserFromObjectPath(const std::string& objectPath)
+{
+    return dbus::utils::getLastSegmentFromObjectPath(objectPath);
+}
+
+SessionIdentifier
+    SessionItem::retrieveIdFromObjectPath(const std::string& objectPath)
+{
+    return SessionManager::parseSessionId(
+        dbus::utils::getLastSegmentFromObjectPath(objectPath));
 }
 
 } // namespace session

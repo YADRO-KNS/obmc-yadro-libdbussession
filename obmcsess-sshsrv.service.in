@@ -1,0 +1,14 @@
+[Unit]
+Description=OpenBMC Session SSH connection watcher service
+
+Wants=dropbear.socket
+After=dropbear.socket
+
+[Service]
+ExecReload=kill -s HUP $MAINPID
+ExecStart=@MESON_INSTALL_PREFIX@/bin/obmcses-sshsvc
+Type=simple
+Restart=always
+
+[Install]
+WantedBy=dropbear.socket
