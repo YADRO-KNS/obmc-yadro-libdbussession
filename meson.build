@@ -1,4 +1,4 @@
-project('libobmcsession', 'cpp',
+project('libobmcsession', ['c','cpp'],
     default_options: [
         'warning_level=3',
         'werror=true',
@@ -9,7 +9,7 @@ project('libobmcsession', 'cpp',
 )
 pkg = import('pkgconfig')
 
-boost = dependency('boost', required: true)
+boost = dependency('boost', modules: ['coroutine', 'context'], required: true)
 threads = dependency('threads', required: true)
 sdbusplus_dep = dependency('sdbusplus', required: true)
 pdi_dep = dependency('phosphor-dbus-interfaces', required: true)
@@ -59,3 +59,26 @@ obmcsession = shared_library('obmcsession',
     install: true,
 )
 pkg.generate(obmcsession)
+
+systemd = dependency('systemd')
+systemd_system_unit_dir = systemd.get_pkgconfig_variable('systemdsystemunitdir')
+bindir = get_option('prefix') + '/' +get_option('bindir')
+
+conf_data = configuration_data()
+conf_data.set('MESON_INSTALL_PREFIX',get_option('prefix'))
+
+configure_file(input : 'obmcsess-sshsrv.service.in',
+    output : 'obmcsess-sshsrv.service',
+    install_dir: systemd_system_unit_dir,
+    configuration: conf_data,
+    install : true
+)
+
+executable('obmcses-sshsvc', 
+    ['services/sshsvc.cpp'],
+    dependencies: [boost, sdbusplus_dep, threads, pl_dep],
+    include_directories: ['include'],
+    link_with: [obmcsession],
+    install: true,
+    install_dir: bindir
+)
